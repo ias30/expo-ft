@@ -461,3 +461,9 @@ Use the same `--delay`, `--replan_steps`, model config and `filter_*` settings a
       url={https://arxiv.org/abs/2605.25477},
 }
 ```
+
+## RealMan RTC-SFT (offline, no RL)
+
+A standalone LeRobot training route with π0.5, horizon 64, prefix lengths 0–5,
+language LoRA rank 128, full action expert/vision updates, and batch 16 × 4
+gradient accumulation is available. See [setup, commands and changes](scripts/realman_tape/README.md).

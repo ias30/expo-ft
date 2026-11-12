@@ -15,3 +15,16 @@ assets/
 client/.venv/
 
 log/
+
+# Standalone RTC-SFT source snapshot and its small normalization assets.
+!third_party/openpi_rtc/src/openpi/
+!third_party/openpi_rtc/src/openpi/**
+!third_party/openpi_rtc/assets/
+!third_party/openpi_rtc/assets/**
+**/__pycache__/
+.pytest_cache/
+
+# Generated local verification checkpoints and runtime traces.
+/verification/checkpoint_memory/roundtrip_*/
+/verification/**/*.log
+/realman_tape_trainingrtc.csv
