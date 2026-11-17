@@ -96,3 +96,63 @@ def test_boundary_faces_are_inclusive(xyz):
     runner = make_runner(measured=xyz)
     runner._check_workspace_motion()
     runner.right_arm.rm_set_arm_slow_stop.assert_not_called()
+
+
+def make_rl_env(fk=None, measured=(0., -.3, 0.)):
+    from expo_ft.realman.environment import RealmanEnv
+    runner = make_runner(fk=fk, measured=measured)
+    env = RealmanEnv(runner.args)
+    env.right_arm = runner.right_arm
+    env.gripper_target_state = 1
+    env._execute_right_gripper_action = Mock()
+    env._move_to_initial_pose = Mock()
+    env._get_current_state = Mock(return_value={'state': np.zeros(7)})
+    env.args.prompt = 'pick up the tape'
+    return env
+
+
+@pytest.mark.parametrize('interior', [False, True])
+def test_rl_rejection_requires_reset_but_keeps_connection(interior):
+    from expo_ft.realman.workspace import WorkspaceMotionRejected
+    def fk(joints):
+        outside = (0 < joints[0] < 1) if interior else joints[0] >= 1
+        return [.115 if outside else 0, -.3, 0, 0, 0, 0]
+    env = make_rl_env(fk=fk)
+    bad = np.array([np.deg2rad(1), 0, 0, 0, 0, 0, 1])
+    with pytest.raises(WorkspaceMotionRejected, match='predicted_path' if interior else 'predicted_target'):
+        env.step(bad)
+    assert env.running and env.fault is None and env.workspace_reset_required
+    env.right_arm.rm_set_arm_slow_stop.assert_called_once()
+    env.right_arm.rm_movej_canfd.assert_not_called()
+    env._execute_right_gripper_action.assert_not_called()
+    with pytest.raises(RuntimeError, match='confirmed reset'):
+        env.step(np.array([0]*6+[1]))
+    env._move_to_initial_pose.assert_not_called()
+    env.reset()  # Same call the main loop makes after the operator presses Enter.
+    assert not env.workspace_reset_required
+    env._move_to_initial_pose.assert_called_once()
+    env.step(np.array([0]*6+[1]))
+    env.right_arm.rm_movej_canfd.assert_called_once()
+
+
+@pytest.mark.parametrize('failure', ['measured', 'current_fk', 'stop', 'post_stop'])
+def test_rl_actual_pose_and_stop_faults_remain_fatal(failure):
+    from expo_ft.realman.workspace import WorkspaceMotionRejected
+    env = make_rl_env(fk=lambda joints: [.115 if joints[0] >= 1 else 0, -.3, 0, 0, 0, 0])
+    if failure == 'measured':
+        env.right_arm.rm_get_current_arm_state.return_value[1]['pose'][0] = .2
+    elif failure == 'current_fk':
+        env.right_arm.rm_algo_forward_kinematics.side_effect = lambda joints: [.2, -.3, 0, 0, 0, 0]
+    elif failure == 'stop':
+        env.right_arm.rm_set_arm_slow_stop.return_value = -1
+    else:
+        env.right_arm.rm_get_current_arm_state.side_effect = [
+            (0, {'joint': [0]*6, 'pose': [0, -.3, 0, 0, 0, 0]}),
+            (0, {'joint': [0]*6, 'pose': [.2, -.3, 0, 0, 0, 0]})]
+    with pytest.raises(RuntimeError) as error:
+        env.step(np.array([np.deg2rad(1), 0, 0, 0, 0, 0, 1]))
+    assert not isinstance(error.value, WorkspaceMotionRejected)
+    assert env.fault and not env.running
+    env.right_arm.rm_movej_canfd.assert_not_called()
+    with pytest.raises(RuntimeError, match='fault is latched'):
+        env.reset()

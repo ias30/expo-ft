@@ -467,3 +467,9 @@ Use the same `--delay`, `--replan_steps`, model config and `filter_*` settings a
 A standalone LeRobot training route with π0.5, horizon 64, prefix lengths 0–5,
 language LoRA rank 128, full action expert/vision updates, and batch 16 × 4
 gradient accumulation is available. See [setup, commands and changes](scripts/realman_tape/README.md).
+
+RealMan online RL from that checkpoint uses `train_realman_rl.py`: labelled episode
+collection, native RTC candidates, edit/Q selection, bounded physical-action replay,
+and episode-boundary learner updates. See [RL setup and commands](scripts/realman_tape/RL.md).
+
+中文真机启动与人工标注流程：[RealMan 真机在线 RL 启动指南](scripts/realman_tape/REAL_ROBOT_START_CN.md)。

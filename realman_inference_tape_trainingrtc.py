@@ -34,6 +34,7 @@ from openpi.policies import policy_config
 from openpi.policies.training_rtc_buffer import TrainingRTCBuffer
 from openpi.shared import normalize
 from openpi.training import config as training_config
+from expo_ft.realman.workspace import WorkspaceMotionRejected
 
 logger = logging.getLogger(__name__)
 PROMPT = "pick up the tape from the rotating disc"
@@ -254,8 +255,8 @@ class RealmanInference:
         Joint interpolation sampling is a software guard, not a controller safety fence.
         Keep the active work/tool frames unchanged during deployment.
         """
-        lower = np.array([-170.0, -500.0, -121.0])
-        upper = np.array([114.0, -150.0, 50.0])
+        lower = np.asarray(getattr(self.args, "workspace_min", (-170.0, -500.0, -118.0)))
+        upper = np.asarray(getattr(self.args, "workspace_max", (114.0, -150.0, 50.0)))
         try:
             code, frame = self.right_arm.rm_get_current_work_frame()
             frame_pose = np.asarray(frame["pose"], dtype=float)
@@ -267,27 +268,47 @@ class RealmanInference:
             current = np.asarray(state["joint"][:6], dtype=float)
             measured = np.asarray(state["pose"][:3], dtype=float) * 1000.0
 
-            def check_xyz(xyz):
+            def check_xyz(xyz, source):
                 if xyz.shape != (3,) or not np.isfinite(xyz).all():
-                    raise ValueError("Invalid TCP position")
+                    raise ValueError(f"Invalid TCP position: source={source}")
                 if np.any(xyz < lower) or np.any(xyz > upper):
-                    raise ValueError(f"TCP outside boundary box: xyz_mm={xyz.tolist()}, min={lower}, max={upper}")
+                    message = f"TCP outside boundary box: source={source}, xyz_mm={xyz.tolist()}, min={lower}, max={upper}"
+                    if source.startswith('predicted_'):
+                        raise WorkspaceMotionRejected(f"Workspace boundary check failed; motion rejected: {message}")
+                    raise ValueError(message)
 
-            check_xyz(measured)
+            check_xyz(measured, 'measured_tcp')
             target = current if target_deg is None else np.asarray(target_deg, dtype=float)
             if current.shape != (6,) or target.shape != (6,) or not np.isfinite([current, target]).all():
                 raise ValueError("Invalid workspace joint values")
             # Compare connected-arm FK with actual TCP to detect frame/tool mismatch.
             fk_current = np.asarray(self.right_arm.rm_algo_forward_kinematics(current.tolist())[:3]) * 1000.0
-            check_xyz(fk_current)
+            check_xyz(fk_current, 'current_fk')
             if np.linalg.norm(fk_current - measured) > 2.0:
                 raise ValueError("FK and measured TCP differ by more than 2 mm; check work/tool frames")
+            if target_deg is None:
+                return
             # Both endpoints may be inside while a joint-space path leaves the box.
             samples = max(1, int(np.ceil(np.max(np.abs(target - current)) / 0.5)))
             for fraction in np.linspace(0.0, 1.0, samples + 1)[1:]:
                 joints = current + fraction * (target - current)
                 xyz = np.asarray(self.right_arm.rm_algo_forward_kinematics(joints.tolist())[:3]) * 1000.0
-                check_xyz(xyz)
+                check_xyz(xyz, 'predicted_target' if fraction == 1 else 'predicted_path')
+        except WorkspaceMotionRejected:
+            try:
+                result = self.right_arm.rm_set_arm_slow_stop()
+                if result != 0:
+                    raise RuntimeError(f'Workspace stop failed: {result}')
+                if getattr(self, 'recover_workspace_rejection', False):
+                    # Streaming motion can continue until the stop completes.
+                    # Recheck actual feedback before declaring this recoverable.
+                    self._check_workspace_motion()
+                else:
+                    self.running = False
+            except Exception as exc:
+                self.running = False
+                raise RuntimeError(f'Workspace rejection recovery failed: {exc}') from exc
+            raise
         except Exception as exc:
             self.running = False
             try:
@@ -304,12 +325,22 @@ class RealmanInference:
         from Robotic_Arm.rm_robot_interface import rm_thread_mode_e
 
         self.right_arm = RoboticArm(rm_thread_mode_e.RM_TRIPLE_MODE_E)
-        handle = self.right_arm.rm_create_robot_arm(self.args.right_robot_ip, 8080)
+        debug_dir = getattr(self.args, "sdk_debug_dir", "")
+        if debug_dir:
+            directory = pathlib.Path(debug_dir).expanduser().resolve()
+            directory.mkdir(parents=True, exist_ok=True)
+            stem = directory / f"sdk-{time.time_ns()}-{os.getpid()}"
+            self._gripper_trace_path = pathlib.Path(str(stem) + ".events.jsonl")
+            self.right_arm.rm_set_log_save(str(stem) + ".raw.log")
+            logger.info("SDK debug logs: %s.raw.log; timeline: %s", stem, self._gripper_trace_path)
+            handle = self.right_arm.rm_create_robot_arm(self.args.right_robot_ip, 8080, level=0)
+        else:
+            handle = self.right_arm.rm_create_robot_arm(self.args.right_robot_ip, 8080)
         if handle.id <= 0:
             raise RuntimeError(f"Right arm connection failed: {handle}")
         logger.info("Right TCP workspace (base frame, mm): min=(-170, -500, -118), max=(114, -150, 50)")
         # Initialization/reset is exempt; policy actions are checked in _execute_action.
-        # Explicit startup release establishes the first known command target.
+        # Explicit startup release establishes the first acknowledged command target.
         self._execute_right_gripper_action(1)
         if self.args.reset_pose:
             self._move_to_initial_pose()
@@ -448,112 +479,78 @@ class RealmanInference:
     @staticmethod
     def _map_gripper_value_to_state(value, current_state):
         # Preserve the original hysteresis: 0=pick/closed, 1=release/open.
-        return int(value >= 0.7) if current_state == 0 else int(value > 0.3)
+        from expo_ft.realman.gripper import gripper_target
+        return gripper_target(value, current_state)
+
+    def _trace_gripper_event(self, event, **fields):
+        """Opt-in diagnostic timeline; recording failure must not change motion handling."""
+        path = getattr(self, "_gripper_trace_path", None)
+        if path is None:
+            return
+        try:
+            record = dict(event=event, wall_time=time.time(), monotonic=time.monotonic(),
+                          operation=getattr(self, "_gripper_operation", 0),
+                          episode=getattr(self, "diagnostic_episode", None),
+                          step=getattr(self, "diagnostic_step", None), **fields)
+            with path.open("a") as stream:
+                stream.write(json.dumps(record) + "\n")
+        except Exception:
+            logger.exception("Could not write gripper diagnostic event %s", event)
 
     def _execute_right_gripper_action(self, target_state):
-        if target_state == self.gripper_target_state:
-            return
         if target_state not in (0, 1):
             raise ValueError("Gripper target must be 0=pick or 1=release")
-        # Match collection: nonblocking commands, timeout=0, no motor/serial API.
+        if target_state == self.gripper_target_state and not getattr(self, "_gripper_command_pending", False):
+            return
+        # Nonblocking physical motion, but wait for the controller's setting ACK.
+        # timeout=1 selects ACK waiting here; it is NOT a one-second motion deadline.
         command = "release" if target_state == 1 else "pick"
-        pause_for_gripper = self.gripper_target_state in (0, 1) and getattr(self.args, "rtc", False)
-        if pause_for_gripper:
-            result = self.right_arm.rm_set_arm_slow_stop()
-            if result != 0:
-                raise RuntimeError(f"Arm stop before gripper {command} failed: {result}")
-            logger.info("RTC paused for gripper %s; waiting for physical completion feedback", command)
-        logger.info("SDK gripper %s starting (block=False, timeout=0)", command)
+        self._gripper_operation = getattr(self, "_gripper_operation", 0) + 1
+        self._trace_gripper_event("gripper_requested", target=target_state, command=command,
+                                  previous_target=self.gripper_target_state,
+                                  last_joint_dispatch=getattr(self, "_last_joint_dispatch", None))
+        # Streaming execution: a gripper transition must not stop the arm, wait
+        # for physical completion, retry an obsolete target, or discard the chunk.
+        self._gripper_command_pending = True
+        self._send_right_gripper_command(target_state)
+        # Command state, not measured position; only cache after controller ACK.
+        self.gripper_target_state = target_state
+        self._gripper_command_pending = False
+        self._trace_gripper_event("gripper_command_accepted", target=target_state)
+
+    def _send_right_gripper_command(self, target_state, *, attempt=1):
+        command = "release" if target_state == 1 else "pick"
+        logger.info("SDK gripper %s starting (block=False, timeout=1; waiting for setting ACK)", command)
         sdk_start = time.monotonic()
+        self._trace_gripper_event("gripper_send", command=command, speed=self.args.gripper_speed,
+                                  force=self.args.gripper_force, block=False, timeout=1, attempt=attempt)
         if target_state == 1:
-            result = self.right_arm.rm_set_gripper_release(self.args.gripper_speed, False, 0)  # noqa: FBT003
+            result = self.right_arm.rm_set_gripper_release(self.args.gripper_speed, False, 1)  # noqa: FBT003
         else:
             result = self.right_arm.rm_set_gripper_pick(
                 self.args.gripper_speed,
                 self.args.gripper_force,
                 False,  # noqa: FBT003
-                0,
+                1,
             )
         logger.info(
             "SDK gripper %s returned after %.1fms (result=%s)", command, (time.monotonic() - sdk_start) * 1000, result
         )
+        self._trace_gripper_event("gripper_ack", result=result, attempt=attempt, duration_ms=(time.monotonic() - sdk_start) * 1000)
+        if result == 1:
+            raise RuntimeError(f"Gripper {command} rejected by controller (setting ACK=false, result=1)")
         if result != 0:
-            raise RuntimeError(f"Right gripper command failed: {result}")
-        # Accepted command target, NOT measured physical gripper position.
-        self.gripper_target_state = target_state
-        if pause_for_gripper:
-            self._wait_for_gripper_target(target_state)
-            self._rtc_replan_after_gripper = True
-
-    def _wait_for_gripper_closed(self):
-        """Compatibility wrapper for waiting on a close command."""
-        self._wait_for_gripper_target(0)
-
-    def _wait_for_gripper_target(self, target_state):
-        """Require two healthy completion samples: open=1, close=2 or 6.
-
-        Force-stop mode 6 does not by itself prove a successful object grasp.
-        """
-        if target_state not in (0, 1):
-            raise ValueError("Gripper target must be 0=pick or 1=release")
-        operation = "close" if target_state == 0 else "release"
-        completion_modes = (2, 6) if target_state == 0 else (1,)
-        timeout = self.args.gripper_close_timeout if target_state == 0 else self.args.gripper_open_timeout
-        started = time.monotonic()
-        deadline = started + timeout
-        stable = 0
-        last_state = None
-        last_mode = None
-        next_log = started
-        polls = 0
-        while self.running:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Gripper {operation} completion timed out after {time.monotonic() - started:.2f}s; "
-                    f"polls={polls}, last_state={last_state}; RTC will not resume"
-                )
-            query_started = time.monotonic()
-            result, state = self.right_arm.rm_get_gripper_state()
-            now = time.monotonic()
-            polls += 1
-            if result != 0:
-                raise RuntimeError(f"Gripper completion query failed: {result}")
-            last_state = dict(state)
-            mode = state.get("mode")
-            if mode != last_mode or now >= next_log:
-                logger.info(
-                    "Gripper %s feedback: elapsed=%.2fs query=%.1fms mode=%s actpos=%s "
-                    "force=%s status=%s enabled=%s error=%s stable=%d/2",
-                    operation, now - started, (now - query_started) * 1000, mode, state.get("actpos"),
-                    state.get("current_force"), state.get("status"), state.get("enable_state"),
-                    state.get("error"), stable,
-                )
-                next_log = now + 1.0
-                last_mode = mode
-            if state.get("status") != 1 or state.get("enable_state") != 1 or state.get("error") != 0:
-                raise RuntimeError(f"Gripper not healthy during {operation}: {state}")
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"Gripper {operation} completion query exceeded timeout; polls={polls}, "
-                    f"last_state={last_state}; RTC will not resume"
-                )
-            stable = stable + 1 if mode in completion_modes else 0
-            if stable >= 2:
-                logger.info(
-                    "Gripper %s completed: mode=%s actpos=%s force=%s; fresh inference may resume",
-                    operation, mode,
-                    state.get("actpos"),
-                    state.get("current_force"),
-                )
-                return
-            time.sleep(0.05)
-        raise InterruptedError(f"Stopped while waiting for gripper {operation}")
+            raise RuntimeError(
+                f"Gripper {command} setting ACK failed (result={result}); command acceptance is unknown"
+            )
+        logger.info("Gripper %s setting ACK succeeded; continuing action stream", command)
 
     def _execute_action(self, action):
         action = np.asarray(action)
         if action.shape != (7,) or not np.isfinite(action).all():
             raise ValueError("Expected seven finite action values")
         self._check_workspace_motion(np.rad2deg(action[:6]))
+        dispatch_started = time.monotonic()
         if getattr(self.args, "rtc", False):
             # 30Hz data: low-follow streaming. High-follow requires <=10ms per SDK.
             sdk_start = time.monotonic()
@@ -565,6 +562,9 @@ class RealmanInference:
             code = self.right_arm.rm_movej(np.rad2deg(action[:6]).tolist(), self.args.speed, 0, 0, True)  # noqa: FBT003
         if code != 0:
             raise RuntimeError(f"Right arm motion failed: {code}")
+        if getattr(self, "_gripper_trace_path", None) is not None:
+            self._last_joint_dispatch = dict(started_at=dispatch_started, returned_at=time.monotonic(), result=code,
+                                             joints_deg=np.rad2deg(action[:6]).tolist())
         target = self._map_gripper_value_to_state(float(np.clip(action[6], 0, 1)), self.gripper_target_state)
         self._execute_right_gripper_action(target)
         if not getattr(self.args, "rtc", False):
@@ -633,19 +633,6 @@ class RealmanInference:
                 self._execute_action(action)
                 writer.writerow([*np.rad2deg(action[:6]), action[6], self.gripper_target_state, time.time()])
                 self._visualize()
-                if getattr(self, "_rtc_replan_after_gripper", False):
-                    # Finish/discard pre-pause inference before reusing the policy RNG.
-                    if pending is not None:
-                        pending.result()
-                        pending = None
-                    if not self.running:
-                        break
-                    fresh = self._run_inference(self._get_current_state())
-                    buffer = TrainingRTCBuffer(fresh)
-                    self._rtc_replan_after_gripper = False
-                    deadline = time.monotonic() + period
-                    logger.info("RTC resumed with fresh observation/chunk after gripper operation; old chunk discarded")
-                    continue
                 deadline += period
         finally:
             self.running = False
@@ -723,16 +710,20 @@ def parse_args(argv=None):
         help="Directory containing ROS1 rospy and sensor_msgs Python packages",
     )
     parser.add_argument("--right-robot-ip", default="169.254.128.19")
+    parser.add_argument("--sdk-debug-dir", default="",
+                        help="Opt-in SDK raw logs and gripper timeline directory; adds read-only feedback queries")
     parser.add_argument("--gripper-speed", type=int, default=400)
     parser.add_argument("--gripper-force", type=int, default=800)
+    parser.add_argument("--gripper-retry-after", type=float, default=0.0,
+                        help="Legacy option, ignored: streaming gripper commands are not retried")
     parser.add_argument(
         "--gripper-close-timeout",
         type=float,
         default=10.0,
-        help="Seconds to wait for physical closure feedback after pick command returns",
+        help="Legacy option, ignored: streaming execution does not wait for closure",
     )
     parser.add_argument("--gripper-open-timeout", type=float, default=10.0,
-                        help="Seconds to wait for physical opening feedback after release")
+                        help="Legacy option, ignored: streaming execution does not wait for opening")
     parser.add_argument("--head-camera-topic", default="/head_camera/image_raw")
     parser.add_argument(
         "--wrist-camera-topic",
@@ -788,6 +779,8 @@ def parse_args(argv=None):
         parser.error("gripper-close-timeout must be finite and positive")
     if not np.isfinite(args.gripper_open_timeout) or args.gripper_open_timeout <= 0:
         parser.error("gripper-open-timeout must be finite and positive")
+    if not np.isfinite(args.gripper_retry_after) or args.gripper_retry_after < 0:
+        parser.error("gripper-retry-after must be finite and nonnegative")
     if not np.isfinite(args.control_timeout_ms) or args.control_timeout_ms <= 0:
         parser.error("control-timeout-ms must be finite and positive")
     if args.rtc_delay_steps < 1 or any(not np.isfinite(x) or x <= 0 for x in (args.control_hz,)):

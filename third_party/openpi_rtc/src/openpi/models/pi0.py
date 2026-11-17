@@ -238,14 +238,15 @@ class Pi0(_model.BaseModel):
         rtc_target: at.Float[at.Array, "b ah ad"] | None = None,
         rtc_weights: at.Float[at.Array, "b ah ad"] | None = None,
         rtc_max_guidance: float = 5.0,
-        rtc_prefix_length: int | at.Int[at.Array, ""] | None = None,
+        rtc_prefix_length: int | at.Int[at.Array, ""] | at.Int[at.Array, "b"] | None = None,
     ) -> _model.Actions:
         # RTC-SFT conditions on clean actions with per-token time=0, matching
         # prefix_loss_terms. Keep the inference-time guidance path separate.
         if rtc_prefix_length is not None:
             if not self.rtc_enabled or rtc_target is None or rtc_weights is not None:
                 raise ValueError("Native RTC requires an RTC-trained model, target, and no guidance weights")
-            clean_prefix_mask = jnp.arange(self.action_horizon)[None, :, None] < rtc_prefix_length
+            lengths = jnp.asarray(rtc_prefix_length).reshape(-1, 1, 1)
+            clean_prefix_mask = jnp.arange(self.action_horizon)[None, :, None] < lengths
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.

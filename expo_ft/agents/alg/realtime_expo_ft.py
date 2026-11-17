@@ -179,7 +179,7 @@ def _sample_actions(rng, apply_fn, params, observations: jnp.ndarray, states, ac
         "encoder_fn", "edit_fn", "critic_fn", "N", "n_edit_samples",
         "num_qs", "num_min_qs", "replan_steps", "action_dim", "state_dim",
         "padded_action_dim", "delay", "edit_scale", "edit_action_xyzg",
-        "freeze_encoder", "only_base_actions", "critic_camera_keys",
+        "freeze_encoder", "only_base_actions", "critic_camera_keys", "critic_action_fn",
     ),
 )
 def _jitted_fast_select(
@@ -188,7 +188,7 @@ def _jitted_fast_select(
     *, encoder_fn, edit_fn, critic_fn, N, n_edit_samples, num_qs,
     num_min_qs, replan_steps, action_dim, state_dim, padded_action_dim,
     delay, edit_scale, edit_action_xyzg, freeze_encoder,
-    only_base_actions, critic_camera_keys,
+    only_base_actions, critic_camera_keys, critic_action_fn=None,
 ):
     """Fast phase of sample_actions in one dispatch: window slice, critic encode,
     edit candidates, target-Q argmax, executed_padded."""
@@ -238,6 +238,8 @@ def _jitted_fast_select(
             q_actions = jnp.concatenate([q_actions, combined], axis=0)
             cand = jnp.concatenate([cand, combined.reshape(n_edit_samples, r, action_dim)], axis=0)
 
+        if critic_action_fn is not None:
+            q_actions = critic_action_fn(q_actions, states_all)
         qs = critic_fn({"params": target_params}, enc_all, q_actions, p=states_all,
                        sample_num=num_min_qs).min(axis=0)
         idx = jnp.argmax(qs)
@@ -665,8 +667,9 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
     def sample_pre_cache(self, observations, prefix_padded=None):
         """Slow phase of real-time chunking: N candidate chunks from the Pi0.5 actor, inpainting
         `prefix_padded` (the in-flight actions) when given. Returns (precached, new_agent) with
-        precached (N, H, action_dim) normalized; pass it to sample_actions with the current obs
-        and delay = len(prefix_padded)."""
+        precached (N, H, action_dim); normally normalized, but physical for adapters
+        with physical_precache=True (their prefixes are also physical). Pass it to
+        sample_actions with the current obs and delay = len(prefix_padded)."""
         infer_sharding = self.actor.infer_sharding
         rng = jax.device_put(self.rng, infer_sharding)
         c = self._infer_cache or {}
@@ -693,6 +696,9 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
                 num_samples=self.N,
             )
         precached = jnp.asarray(precached)  # (N, H, action_dim) normalized
+        if getattr(self.actor, "physical_precache", False):
+            codec = self.actor.action_codec
+            precached = codec.decode(precached, codec.unnormalize(p1_transformed_inputs["state"], "state"))
         return precached, self.replace(rng=rng)
 
     def sample_actions(self, observations, precached=None, delay=0, only_base_actions=False):
@@ -719,6 +725,8 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
         _target_critic_params = c.get("target_critic_params") or jax.device_put(self.target_critic.params, infer_sharding)
 
         sample_time = None
+        physical_precache = getattr(self.actor, "physical_precache", False)
+        cached_is_physical = physical_precache and precached is not None
         if precached is None:
             # Non-overlapped / boot: sample the actor inline on the current obs (delay=0).
             delay = 0
@@ -735,6 +743,8 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
         D_pad = self.actor.model_config.action_dim
 
         def _unnorm(win_norm):
+            if physical_precache:
+                return self.actor.process_transformed_outputs(win_norm, raw_state=observations["state"])
             # Pad the window to a full chunk for process_transformed_outputs, then slice [:r] back.
             n = win_norm.shape[0]
             win_full = jnp.concatenate(
@@ -744,6 +754,8 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
 
         # Critic / edit correction conditions on the CURRENT obs.
         transformed_inputs_cur = self.actor.process_raw_inputs(observations, self.action_dim, self.resize_size)
+        if cached_is_physical:
+            precached = self.actor.action_codec.encode(precached, observations["state"])
 
         # Window slice -> critic encode -> edit candidates -> Q-select, as one jitted call.
         sel = _jitted_fast_select(
@@ -760,6 +772,7 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
             edit_action_xyzg=self.edit_action_xyzg,
             freeze_encoder=self.freeze_encoder,
             only_base_actions=only_base_actions,
+            critic_action_fn=getattr(self.actor, "critic_actions", None),
             critic_camera_keys=self.critic_camera_keys,
         )
         selected = sel["selected"]  # (r, action_dim)
@@ -780,11 +793,11 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
     def sample_batch_actions(self, batch):
         if self.q_edit_use_main_obs and self.delay > 0:
             # Edit + Q-selection see the main actor's delayed obs.
-            critic_obs = jnp.squeeze(stack_critic_cameras(batch["next_delayed_image"], self.critic_camera_keys))
-            states = jnp.squeeze(batch["next_delayed_critic_states"])
+            critic_obs = stack_critic_cameras(batch["next_delayed_image"], self.critic_camera_keys)
+            states = batch["next_delayed_critic_states"]
         else:
-            critic_obs = jnp.squeeze(batch["next_observations"])
-            states = jnp.squeeze(batch["next_critic_states"])
+            critic_obs = batch["next_observations"]
+            states = batch["next_critic_states"]
         critic_obs = jax.device_put(critic_obs)
         batch_size = critic_obs.shape[0]
         states = jax.device_put(states, self.data_sharding)
@@ -815,12 +828,12 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
             # Also condition Q_f on the actor's (delayed) obs: image latent + proprio.
             if delay > 0:
                 old_critic_obs = jax.device_put(
-                    jnp.squeeze(stack_critic_cameras(batch["next_delayed_image"], self.critic_camera_keys))
+                    stack_critic_cameras(batch["next_delayed_image"], self.critic_camera_keys)
                 )
                 old_encoded_obs = jax.device_put(
                     self._encode_observations(old_critic_obs, stop_gradient=True), self.data_sharding
                 )
-                old_states = jax.device_put(jnp.squeeze(batch["next_delayed_critic_states"]), self.data_sharding)
+                old_states = jax.device_put(batch["next_delayed_critic_states"], self.data_sharding)
             else:
                 old_encoded_obs, old_states = encoded_obs, states  # actor obs == next obs
             filter_encoded_obs = jax.device_put(
@@ -854,20 +867,30 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
             # In-flight prefix = last `delay` actions of the executed chunk, at positions [0:delay].
             full_actions = batch["full_actions"].reshape(batch_size, self.action_horizon, self.action_dim)
             prefix = full_actions[:, r - delay:r, :]  # (B, delay, action_dim)
+            if getattr(self.actor, "physical_precache", False):
+                prefix = self.actor.action_codec.rebase(prefix, batch["state"], batch["next_delayed_state"])
             prefix = jnp.concatenate(
                 [prefix, jnp.zeros((batch_size, delay, D_pad - self.action_dim), dtype=prefix.dtype)],
                 axis=-1,
             )  # (B, delay, D_pad)
             prefix = jax.device_put(prefix, self.data_sharding)
+            prefix_kwargs = {}
+            if "bootstrap_delay" in batch:
+                prefix_kwargs["prefix_lengths"] = batch["bootstrap_delay"]
             actor_actions, sample_time = self.actor.sample_training_actions_with_prefix(
                 transformed_inputs=transformed_inputs,
                 train_state=self.actor_train_state,
                 rng=key,
                 prefix_padded=prefix,
+                **prefix_kwargs,
                 num_samples=1,
                 noise=kept_noise[:, None],
             )
-            actor_actions = actor_actions[:, delay:delay + r, :]  # execution window
+            if "bootstrap_delay" in batch:
+                offsets = batch["bootstrap_delay"][:, None] + jnp.arange(r)[None, :]
+                actor_actions = jnp.take_along_axis(actor_actions, offsets[..., None], axis=1)
+            else:
+                actor_actions = actor_actions[:, delay:delay + r, :]  # execution window
         else:
             actor_actions, sample_time = self.actor.sample_training_actions(
                 transformed_inputs=transformed_inputs,
@@ -878,6 +901,9 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
                 noise=kept_noise[:, None],
             )
             actor_actions = actor_actions[:, :r, :]
+        if delay > 0 and getattr(self.actor, "physical_precache", False):
+            actor_actions = self.actor.action_codec.rebase(
+                actor_actions, batch["next_delayed_state"], batch["next_state"])
         actions = actor_actions.reshape(batch_size, 1, self.full_action_dim)
 
         # Sample edit actions (bases = the single filtered action, repeated)
@@ -910,13 +936,15 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
         states_flat = jax.device_put(jnp.repeat(states, total_candidates, axis=0), self.data_sharding)
         actions_flat = jax.device_put(actions.reshape(-1, actions.shape[-1]), self.data_sharding)
 
+        if getattr(self.actor, "physical_precache", False):
+            actions_flat = self.actor.critic_actions(actions_flat, states_flat)
         qs = self._compute_q_split(self.target_critic.apply_fn, target_params, obs_flat, actions_flat, states_flat)
         qs = qs.reshape(batch_size, total_candidates)
 
         best_indices = jnp.argmax(qs, axis=1)
 
         batch_indices = jnp.arange(batch_size)
-        best_actions = actions[batch_indices, best_indices]
+        best_actions = actions_flat.reshape(batch_size, total_candidates, -1)[batch_indices, best_indices]
 
         without_edit_mask = best_indices < 1
         with_edit_mask = (best_indices >= 1) & (best_indices < total_candidates)
@@ -941,7 +969,7 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
         }
 
         rng, _ = jax.random.split(rng, 2)
-        return jnp.array(best_actions.squeeze()), sample_info_extra, rng
+        return jnp.array(best_actions), sample_info_extra, rng
          
     def update_edit_actor(self, batch: DatasetDict) -> Tuple[AgentLearner, Dict[str, float]]:
         key, rng = jax.random.split(self.rng)
@@ -963,6 +991,8 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
             log_probs -= actions.shape[-1] * jnp.log(self.edit_scale)
 
             actions = edit_scaled + batch["actions"]
+            if getattr(self.actor, "physical_precache", False):
+                actions = self.actor.critic_actions(actions, batch['critic_states'], batch.get('window_length'))
 
             qs = self.critic.apply_fn(
                 {"params": self.critic.params},
@@ -1064,7 +1094,7 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
         next_q_nan_ratio = jnp.mean(next_q_nan_mask)
         next_qs = jnp.where(next_q_nan_mask, 0.0, next_qs)
         next_q = next_qs.min(axis=0)
-        target_q = batch["rewards"] + (self.discount ** self.replan_steps) * batch["masks"] * next_q
+        target_q = batch["rewards"] + batch.get("bootstrap_discount", self.discount ** self.replan_steps) * batch["masks"] * next_q
 
         key, rng = jax.random.split(rng)
 
@@ -1086,10 +1116,13 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
                 )
             # Apply sharding constraint to encoded observations (works inside grad)
             observations = jax.lax.with_sharding_constraint(observations, self.data_sharding)
+            q_actions = batch["actions"]
+            if getattr(self.actor, "physical_precache", False):
+                q_actions = self.actor.critic_actions(q_actions, batch['critic_states'], batch.get('window_length'))
             qs = self.critic.apply_fn(
                 {"params": params_dict['critic']},
                 observations,
-                batch["actions"],
+                q_actions,
                 True,
                 p=batch['critic_states'], 
                 rngs={"dropout": key},
@@ -1161,12 +1194,21 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
             agent.replace(_infer_cache=None), batch, utd_ratio, actor_batch,
             train_actor=train_actor,
         )
+        if not train_actor:
+            new_agent = new_agent.replace(actor_train_state=agent.actor_train_state,
+                                          target_actor_params=agent.target_actor_params)
         return new_agent.cache_infer_params(), info
 
+    def update_critic_only(self, batch: DatasetDict):
+        """One critic/filter step; defer policy updates and inference cache refresh."""
+        agent = self.replace(_infer_cache=None)
+        updated, info = agent._update_jit(agent, batch, 1, train_actor=False, update_policies=False)
+        return updated.replace(actor_train_state=agent.actor_train_state,
+                               target_actor_params=agent.target_actor_params), info
 
-    @partial(jax.jit, static_argnames=("utd_ratio", "train_actor"))
+    @partial(jax.jit, static_argnames=("utd_ratio", "train_actor", "update_policies"))
     def _update_jit(self, agent, batch: DatasetDict, utd_ratio: int, actor_batch: DatasetDict = None,
-                    train_actor: bool = True):
+                    train_actor: bool = True, update_policies: bool = True):
         batch = batch.copy()
         rng, key1 = jax.random.split(agent.rng)
         rng, key2 = jax.random.split(rng)
@@ -1210,6 +1252,11 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
 
         (new_agent,), critic_infos = jax.lax.scan(critic_update_step, (new_agent,), minibatches)
 
+        if not update_policies:
+            # Do not return gigabytes of unchanged VLA arrays through XLA/scan.
+            # The Python wrapper reuses the original frozen objects instead.
+            return new_agent.replace(actor_train_state=None, target_actor_params=None), jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
+
         # Use last minibatch for actor updates
         last_minibatch = jax.tree_util.tree_map(lambda x: x[-1] if x is not None and hasattr(x, "shape") else x, minibatches)
 
@@ -1235,4 +1282,6 @@ class RealTimeEXPOFTLearner(AgentLearner, struct.PyTreeNode):
             actor_info = {**actor_info, **r_actor_info, **temp_info}
 
         critic_info = jax.tree_util.tree_map(lambda x: x[-1], critic_infos)
+        if not train_actor:
+            new_agent = new_agent.replace(actor_train_state=None, target_actor_params=None)
         return new_agent, {**actor_info, **critic_info}

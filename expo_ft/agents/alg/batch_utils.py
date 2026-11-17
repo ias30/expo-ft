@@ -50,10 +50,10 @@ def prepare_actor_sampling_batch(batch):
         "image": batch["next_image"],
         "image_mask": batch["next_image_mask"],
         "state": batch["next_states"],
-        "tokenized_prompt": batch['tokenized_prompt'],
-        "tokenized_prompt_mask": batch['tokenized_prompt_mask'],
-        "token_ar_mask": batch.get('token_ar_mask', None),
-        "token_loss_mask": batch.get('token_loss_mask', None),
+        "tokenized_prompt": batch.get("next_tokenized_prompt", batch["tokenized_prompt"]),
+        "tokenized_prompt_mask": batch.get("next_tokenized_prompt_mask", batch["tokenized_prompt_mask"]),
+        "token_ar_mask": batch.get("next_token_ar_mask", batch.get("token_ar_mask")),
+        "token_loss_mask": batch.get("next_token_loss_mask", batch.get("token_loss_mask")),
     }
 
 
@@ -64,10 +64,10 @@ def prepare_actor_sampling_batch_delayed(batch):
         "image": batch["next_delayed_image"],
         "image_mask": batch["next_delayed_image_mask"],
         "state": batch["next_delayed_states"],
-        "tokenized_prompt": batch['tokenized_prompt'],
-        "tokenized_prompt_mask": batch['tokenized_prompt_mask'],
-        "token_ar_mask": batch.get('token_ar_mask', None),
-        "token_loss_mask": batch.get('token_loss_mask', None),
+        "tokenized_prompt": batch.get("next_delayed_tokenized_prompt", batch["tokenized_prompt"]),
+        "tokenized_prompt_mask": batch.get("next_delayed_tokenized_prompt_mask", batch["tokenized_prompt_mask"]),
+        "token_ar_mask": batch.get("next_delayed_token_ar_mask", batch.get("token_ar_mask")),
+        "token_loss_mask": batch.get("next_delayed_token_loss_mask", batch.get("token_loss_mask")),
     }
 
 def extract_critic_fields(processed_inputs, padded_dim, state_dim,
