@@ -7,5 +7,5 @@ def get_config():
         env_type='realman', language_instruction='pick up the tape from the rotating disc',
         critic_camera_keys=('base_0_rgb', 'right_wrist_0_rgb'),
         edit_action_xyzg=False, control_hz=30.0, replan_steps=30, delay=5,
-        workspace_min=(-170., -500., -122.), workspace_max=(114., -150., 50.),
+        workspace_min=(-170., -500., -123.), workspace_max=(114., -150., 50.),
     ))
